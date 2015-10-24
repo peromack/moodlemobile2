@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <widget id="com.quickertutor.mobile" version="2.4" xmlns="http://www.w3.org/ns/widgets" xmlns:cdv="http://cordova.apache.org/ns/1.0">
   <name>QuickerTutor Mobile</name>
-  <description>Official QuickerTutor Mobile app</description>
+  <description>Official QuickerTutor Mobile App</description>
   <author href="http://quickertutor.com" email="info@quickertutor.com">QuickerTutor</author>
   <content src="index.html"/>
   <access origin="*"/>
