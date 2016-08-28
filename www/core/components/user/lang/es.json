@@ -5,6 +5,8 @@
     "country": "País",
     "description": "Descripción",
     "details": "Detalles",
+    "detailsnotavailable": "No tiene acceso a los detalles de este usuario.",
+    "editingteacher": "Profesor",
     "email": "Email",
     "interests": "Intereses",
     "invaliduser": "Usuario no válido",
@@ -13,5 +15,7 @@
     "phone2": "Móvil",
     "roles": "Roles",
     "student": "Estudiante",
+    "teacher": "Profesor sin permiso de edición",
+    "viewprofile": "Ver perfil",
     "webpage": "Página web"
 }

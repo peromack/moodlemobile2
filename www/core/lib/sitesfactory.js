@@ -115,8 +115,9 @@ angular.module('mm.core')
         return exists;
     }
 
-    this.$get = function($http, $q, $mmWS, $mmDB, $mmConfig, $log, md5, $mmApp, $mmLang, $mmUtil, $mmFS, mmCoreWSCacheStore,
-            mmCoreWSPrefix, mmCoreSessionExpired, $mmEvents, mmCoreEventSessionExpired, mmCoreUserDeleted, mmCoreEventUserDeleted) {
+    this.$get = function($http, $q, $mmWS, $mmDB, $log, md5, $mmApp, $mmLang, $mmUtil, $mmFS, mmCoreWSCacheStore,
+            mmCoreWSPrefix, mmCoreSessionExpired, $mmEvents, mmCoreEventSessionExpired, mmCoreUserDeleted, mmCoreEventUserDeleted,
+            $mmText, $translate, mmCoreConfigConstants) {
 
         $log = $log.getInstance('$mmSite');
 
@@ -403,6 +404,9 @@ angular.module('mm.core')
          *                                        flag the cache entry, it doesn't affect the data retrieved in this call.
          *                    - getCacheUsingCacheKey (boolean) True if it should retrieve cached data by cacheKey,
          *                                        false if it should get the data based on the params passed (usual behavior).
+         *                    - filter boolean (true) True to filter WS response (moodlewssettingfilter), false otherwise.
+         *                    - rewriteurls boolean (true) True to rewrite URLs (moodlewssettingfileurl), false otherwise.
+         * @param {Boolean} retrying True if we're retrying the call for some reason. This is to prevent infinite loops.
          * @return {Promise}
          * @description
          *
@@ -416,13 +420,13 @@ angular.module('mm.core')
          * compatibility one if need be, usually that means that it will fallback on
          * the 'local_mobile_' prefixed function if it is available and the non-prefixed is not.
          */
-        Site.prototype.request = function(method, data, preSets) {
-            var deferred = $q.defer(),
-                site = this;
+        Site.prototype.request = function(method, data, preSets, retrying) {
+            var site = this,
+                initialToken = site.token;
             data = data || {};
 
             // Get the method to use based on the available ones.
-            method = getCompatibleFunction(site, method);
+            method = site.getCompatibleFunction(method);
 
             // Check if the method is available, use a prefixed version if possible.
             // We ignore this check when we do not have the site info, as the list of functions is not loaded yet.
@@ -432,8 +436,7 @@ angular.module('mm.core')
                     method = mmCoreWSPrefix + method;
                 } else {
                     $log.error("WS function '" + method + "' is not available, even in compatibility mode.");
-                    $mmLang.translateAndRejectDeferred(deferred, 'mm.core.wsfunctionnotavailable');
-                    return deferred.promise;
+                    return $mmLang.translateAndReject('mm.core.wsfunctionnotavailable');
                 }
             }
 
@@ -441,12 +444,11 @@ angular.module('mm.core')
             preSets.wstoken = site.token;
             preSets.siteurl = site.siteurl;
 
-            // Enable text filtering.
-            data.moodlewssettingfilter = true;
+            // Enable text filtering by default.
+            data.moodlewssettingfilter = preSets.filter === false ? false : true;
+            data.moodlewssettingfileurl = preSets.rewriteurls === false ? false : true;
 
-            getFromCache(site, method, data, preSets).then(function(data) {
-                deferred.resolve(data);
-            }, function() {
+            return getFromCache(site, method, data, preSets).catch(function() {
                 // Do not pass those options to the core WS factory.
                 var wsPreSets = angular.copy(preSets);
                 delete wsPreSets.getFromCache;
@@ -456,9 +458,9 @@ angular.module('mm.core')
                 delete wsPreSets.emergencyCache;
                 delete wsPreSets.getCacheUsingCacheKey;
 
-                // TODO: Sync
+                // @todo Sync
 
-                $mmWS.call(method, data, wsPreSets).then(function(response) {
+                return $mmWS.call(method, data, wsPreSets).then(function(response) {
 
                     if (preSets.saveToCache) {
                         saveToCache(site, method, data, response, preSets.cacheKey);
@@ -466,33 +468,40 @@ angular.module('mm.core')
 
                     // We pass back a clone of the original object, this may
                     // prevent errors if in the callback the object is modified.
-                    deferred.resolve(angular.copy(response));
-                }, function(error) {
+                    return angular.copy(response);
+                }).catch(function(error) {
                     if (error === mmCoreSessionExpired) {
+                        if (initialToken !== site.token && !retrying) {
+                            // Token has changed, retry with the new token.
+                            return site.request(method, data, preSets, true);
+                        } else if ($mmApp.isSSOAuthenticationOngoing()) {
+                            // There's an SSO authentication ongoing, wait for it to finish and try again.
+                            return $mmApp.waitForSSOAuthentication().then(function() {
+                                return site.request(method, data, preSets, true);
+                            });
+                        }
+
                         // Session expired, trigger event.
-                        $mmLang.translateAndRejectDeferred(deferred, 'mm.core.lostconnection');
                         $mmEvents.trigger(mmCoreEventSessionExpired, site.id);
+                        // Change error message. We'll try to get data from cache.
+                        error = $translate.instant('mm.core.lostconnection');
                     } else if (error === mmCoreUserDeleted) {
                         // User deleted, trigger event.
-                        $mmLang.translateErrorAndReject(deferred, 'mm.core.userdeleted');
                         $mmEvents.trigger(mmCoreEventUserDeleted, {siteid: site.id, params: data});
+                        return $mmLang.translateAndReject('mm.core.userdeleted');
                     } else if (typeof preSets.emergencyCache !== 'undefined' && !preSets.emergencyCache) {
                         $log.debug('WS call ' + method + ' failed. Emergency cache is forbidden, rejecting.');
-                        deferred.reject(error);
-                    } else {
-                        $log.debug('WS call ' + method + ' failed. Trying to use the emergency cache.');
-                        preSets.omitExpires = true;
-                        preSets.getFromCache = true;
-                        getFromCache(site, method, data, preSets).then(function(data) {
-                            deferred.resolve(data);
-                        }, function() {
-                            deferred.reject(error);
-                        });
+                        return $q.reject(error);
                     }
+
+                    $log.debug('WS call ' + method + ' failed. Trying to use the emergency cache.');
+                    preSets.omitExpires = true;
+                    preSets.getFromCache = true;
+                    return getFromCache(site, method, data, preSets).catch(function() {
+                        return $q.reject(error);
+                    });
                 });
             });
-
-            return deferred.promise;
         };
 
         /**
@@ -536,6 +545,15 @@ angular.module('mm.core')
          * @return {Promise}
          */
         Site.prototype.uploadFile = function(uri, options) {
+            if (!options.fileArea) {
+                if (parseInt(this.infos.version, 10) >= 2016052300) {
+                    // From Moodle 3.1 only draft is allowed.
+                    options.fileArea = 'draft';
+                } else {
+                    options.fileArea = 'private';
+                }
+            }
+
             return $mmWS.uploadFile(uri, options, {
                 siteurl: this.siteurl,
                 token: this.token
@@ -630,8 +648,9 @@ angular.module('mm.core')
         Site.prototype.deleteFolder = function() {
             if ($mmFS.isAvailable()) {
                 var siteFolder = $mmFS.getSiteFolder(this.id);
-                // Ignore any errors, $mmFS.removeDir fails if folder doesn't exists.
-                return $mmFS.removeDir(siteFolder);
+                return $mmFS.removeDir(siteFolder).catch(function() {
+                    // Ignore any errors, $mmFS.removeDir fails if folder doesn't exists.
+                });
             } else {
                 return $q.when();
             }
@@ -668,52 +687,77 @@ angular.module('mm.core')
          * Check if the local_mobile plugin is installed in the Moodle site.
          * This plugin provide extended services.
          *
-         * @return {Promise} Promise resolved when the check is done. Resolve params:
-         *                           - {Number} code Code to identify the authentication method to use.
-         *                           - {String} [service] If defined, name of the service to use.
-         *                           - {String} [warning] If defined, code of the warning message.
+         * @param {Boolean} retrying True if we're retrying the check.
+         * @return {Promise}         Promise resolved when the check is done. Resolve params:
+         *                                   - {Number} code Code to identify the authentication method to use.
+         *                                   - {String} [service] If defined, name of the service to use.
+         *                                   - {String} [warning] If defined, code of the warning message.
          */
-        Site.prototype.checkLocalMobilePlugin = function() {
-            var siteurl = this.siteurl;
+        Site.prototype.checkLocalMobilePlugin = function(retrying) {
+            var siteurl = this.siteurl,
+                self = this,
+                service = mmCoreConfigConstants.wsextservice;
 
-            return $mmConfig.get('wsextservice').then(function(service) {
+            if (!service) {
+                // External service not defined.
+                return $q.when({code: 0});
+            }
 
-                return $http.post(siteurl + '/local/mobile/check.php', {service: service}).then(function(response) {
-                    var data = response.data;
+            return $http.post(siteurl + '/local/mobile/check.php', {service: service}).then(function(response) {
+                var data = response.data;
 
-                    if (typeof data == 'undefined' || typeof data.code == 'undefined') {
-                        // local_mobile returned something we didn't expect. Let's assume it's not installed.
-                        return {code: 0, warning: 'mm.login.localmobileunexpectedresponse'};
-                    }
-
-                    var code = parseInt(data.code, 10);
-                    if (data.error) {
-                        switch (code) {
-                            case 1:
-                                // Site in maintenance mode.
-                                return $mmLang.translateAndReject('mm.login.siteinmaintenance');
-                            case 2:
-                                // Web services not enabled.
-                                return $mmLang.translateAndReject('mm.login.webservicesnotenabled');
-                            case 3:
-                                // Extended service not enabled, but the official is enabled.
-                                return {code: 0};
-                            case 4:
-                                // Neither extended or official services enabled.
-                                return $mmLang.translateAndReject('mm.login.mobileservicesnotenabled');
-                            default:
-                                return $mmLang.translateAndReject('mm.core.unexpectederror');
-                        }
+                if (typeof data != 'undefined' && data.errorcode === 'requirecorrectaccess') {
+                    if (!retrying) {
+                        self.siteurl = $mmText.addOrRemoveWWW(siteurl);
+                        return self.checkLocalMobilePlugin(true);
                     } else {
-                        return {code: code, service: service};
+                        return $q.reject(data.error);
                     }
-                }, function() {
-                    return {code: 0};
-                });
+                } else if (typeof data == 'undefined' || typeof data.code == 'undefined') {
+                    // local_mobile returned something we didn't expect. Let's assume it's not installed.
+                    return {code: 0, warning: 'mm.login.localmobileunexpectedresponse'};
+                }
 
+                var code = parseInt(data.code, 10);
+                if (data.error) {
+                    switch (code) {
+                        case 1:
+                            // Site in maintenance mode.
+                            return $mmLang.translateAndReject('mm.login.siteinmaintenance');
+                        case 2:
+                            // Web services not enabled.
+                            return $mmLang.translateAndReject('mm.login.webservicesnotenabled');
+                        case 3:
+                            // Extended service not enabled, but the official is enabled.
+                            return {code: 0};
+                        case 4:
+                            // Neither extended or official services enabled.
+                            return $mmLang.translateAndReject('mm.login.mobileservicesnotenabled');
+                        default:
+                            return $mmLang.translateAndReject('mm.core.unexpectederror');
+                    }
+                } else {
+                    return {code: code, service: service};
+                }
             }, function() {
                 return {code: 0};
             });
+        };
+
+        /**
+         * Check if local_mobile has been installed in Moodle.
+         *
+         * @return {Boolean} If App is able to use local_mobile plugin.
+         */
+        Site.prototype.checkIfAppUsesLocalMobile = function() {
+            var appUsesLocalMobile = false;
+            angular.forEach(this.infos.functions, function(func) {
+                if (func.name.indexOf(mmCoreWSPrefix) != -1) {
+                    appUsesLocalMobile = true;
+                }
+            });
+
+            return appUsesLocalMobile;
         };
 
         /**
@@ -722,12 +766,7 @@ angular.module('mm.core')
          * @return {Promise} Promise resolved it local_mobile was added, rejected otherwise.
          */
         Site.prototype.checkIfLocalMobileInstalledAndNotUsed = function() {
-            var appUsesLocalMobile = false;
-            angular.forEach(this.infos.functions, function(func) {
-                if (func.name.indexOf(mmCoreWSPrefix) != -1) {
-                    appUsesLocalMobile = true;
-                }
-            });
+            var appUsesLocalMobile = this.checkIfAppUsesLocalMobile();
 
             if (appUsesLocalMobile) {
                 // App already uses local_mobile, it wasn't added.
@@ -741,6 +780,21 @@ angular.module('mm.core')
                 }
                 return data;
             });
+        };
+
+        /**
+         * Check if a URL belongs to this site.
+         *
+         * @param  {String}  url URL to check.
+         * @return {Boolean}     True if URL belongs to this site, false otherwise.
+         */
+        Site.prototype.containsUrl = function(url) {
+            if (!url) {
+                return false;
+            }
+            var siteurl = $mmText.removeProtocolAndWWW(this.siteurl);
+            url = $mmText.removeProtocolAndWWW(url);
+            return url.indexOf(siteurl) == 0;
         };
 
         /**
@@ -764,14 +818,13 @@ angular.module('mm.core')
          * Return the function to be used, based on the available functions in the site. It'll try to use non-deprecated
          * functions first, and fallback to deprecated ones if needed.
          *
-         * @param  {Object} site   Site to check.
          * @param  {String} method WS function to check.
          * @return {String}        Method to use based in the available functions.
          */
-        function getCompatibleFunction(site, method) {
+        Site.prototype.getCompatibleFunction = function(method) {
             if (typeof deprecatedFunctions[method] !== "undefined") {
                 // Deprecated function is being used. Warn the developer.
-                if (site.wsAvailable(deprecatedFunctions[method])) {
+                if (this.wsAvailable(deprecatedFunctions[method])) {
                     $log.warn("You are using deprecated Web Services: " + method +
                         " you must replace it with the newer function: " + deprecatedFunctions[method]);
                     return deprecatedFunctions[method];
@@ -779,10 +832,10 @@ angular.module('mm.core')
                     $log.warn("You are using deprecated Web Services. " +
                         "Your remote site seems to be outdated, consider upgrade it to the latest Moodle version.");
                 }
-            } else if (!site.wsAvailable(method)) {
+            } else if (!this.wsAvailable(method)) {
                 // Method not available. Check if there is a deprecated method to use.
                 for (var oldFunc in deprecatedFunctions) {
-                    if (deprecatedFunctions[oldFunc] === method && site.wsAvailable(oldFunc)) {
+                    if (deprecatedFunctions[oldFunc] === method && this.wsAvailable(oldFunc)) {
                         $log.warn("Your remote site doesn't support the function " + method +
                             ", it seems to be outdated, consider upgrade it to the latest Moodle version.");
                         return oldFunc; // Use deprecated function.
@@ -790,7 +843,7 @@ angular.module('mm.core')
                 }
             }
             return method;
-        }
+        };
 
         /**
          * Get a WS response from cache.
@@ -870,29 +923,23 @@ angular.module('mm.core')
          */
         function saveToCache(site, method, data, response, cacheKey) {
             var db = site.db,
-                deferred = $q.defer(),
-                id = md5.createHash(method + ':' + JSON.stringify(data));
-
-            if (!db) {
-                deferred.reject();
-            } else {
-                $mmConfig.get('cache_expiration_time').then(function(cacheExpirationTime) {
-
-                    var entry = {
+                id = md5.createHash(method + ':' + JSON.stringify(data)),
+                cacheExpirationTime = mmCoreConfigConstants.cache_expiration_time,
+                entry = {
                         id: id,
                         data: response
                     };
-                    entry.expirationtime = new Date().getTime() + cacheExpirationTime;
-                    if (cacheKey) {
-                        entry.key = cacheKey;
-                    }
-                    db.insert(mmCoreWSCacheStore, entry);
-                    deferred.resolve();
 
-                }, deferred.reject);
+            if (!db) {
+                return $q.reject();
+            } else {
+                cacheExpirationTime = isNaN(cacheExpirationTime) ? 300000 : cacheExpirationTime;
+                entry.expirationtime = new Date().getTime() + cacheExpirationTime;
+                if (cacheKey) {
+                    entry.key = cacheKey;
+                }
+                return db.insert(mmCoreWSCacheStore, entry);
             }
-
-            return deferred.promise;
         }
 
         /**

@@ -15,6 +15,7 @@
 angular.module('mm.core.login')
 
 .constant('mmLoginSSOCode', 2) // This code is returned by local_mobile Moodle plugin if SSO in browser is required.
+.constant('mmLoginSSOInAppCode', 3)
 .constant('mmLoginLaunchSiteURL', 'mmLoginLaunchSiteURL')
 .constant('mmLoginLaunchPassport', 'mmLoginLaunchPassport')
 
@@ -25,12 +26,63 @@ angular.module('mm.core.login')
  * @ngdoc service
  * @name $mmLoginHelper
  */
-.factory('$mmLoginHelper', function($q, $log, $mmConfig, $translate, mmLoginSSOCode, mmLoginLaunchSiteURL, mmLoginLaunchPassport,
-            md5, $mmSite, $mmSitesManager, $mmLang, $mmUtil) {
+.factory('$mmLoginHelper', function($q, $log, $mmConfig, mmLoginSSOCode, mmLoginSSOInAppCode, mmLoginLaunchSiteURL,
+            mmLoginLaunchPassport, md5, $mmSite, $mmSitesManager, $mmLang, $mmUtil, $state, $mmAddonManager,
+            $translate, mmCoreConfigConstants) {
 
     $log = $log.getInstance('$mmLoginHelper');
 
     var self = {};
+
+    /**
+     * Go to the view to add a new site.
+     * If a fixed URL is configured, go to credentials instead.
+     *
+     * @module mm.core.login
+     * @ngdoc method
+     * @name $mmLoginHelper#goToAddSite
+     * @return {Promise} Promise resolved when the state changes.
+     */
+    self.goToAddSite = function() {
+        if (mmCoreConfigConstants.siteurl) {
+            // Fixed URL is set, go to credentials page.
+            return $state.go('mm_login.credentials', {siteurl: mmCoreConfigConstants.siteurl});
+        } else {
+            return $state.go('mm_login.site');
+        }
+    };
+
+    /**
+     * Go to the initial page of a site depending on 'userhomepage' setting.
+     *
+     * @module mm.core.login
+     * @ngdoc method
+     * @name $mmLoginHelper#goToSiteInitialPage
+     * @return {Promise} Promise resolved when the state changes.
+     */
+    self.goToSiteInitialPage = function() {
+        if ($mmSite.getInfo() && $mmSite.getInfo().userhomepage === 0) {
+            // Configured to go to Site Home. Check if plugin is installed in the app.
+            var $mmaFrontpage = $mmAddonManager.get('$mmaFrontpage');
+            if ($mmaFrontpage) {
+                return $state.go('site.mm_course-section');
+            }
+        }
+
+        return $state.go('site.mm_courses');
+    };
+
+    /**
+     * Check if the app is configured to use a fixed URL.
+     *
+     * @module mm.core.login
+     * @ngdoc method
+     * @name $mmLoginHelper#isFixedUrlSet
+     * @return {Boolean} True if set, false otherwise.
+     */
+    self.isFixedUrlSet = function() {
+        return typeof mmCoreConfigConstants.siteurl != 'undefined';
+    };
 
     /**
      * Check if SSO login is needed based on code returned by the WS.
@@ -42,7 +94,7 @@ angular.module('mm.core.login')
      * @return {Boolean}      True if SSO login is needed, false othwerise.
      */
     self.isSSOLoginNeeded = function(code) {
-        return code == mmLoginSSOCode;
+        return code == mmLoginSSOCode || code == mmLoginSSOInAppCode;
     };
 
     /**
@@ -52,23 +104,33 @@ angular.module('mm.core.login')
      * @ngdoc method
      * @name $mmLoginHelper#openBrowserForSSOLogin
      * @param {String} siteurl URL of the site where the SSO login will be performed.
+     * @param {Number} typeOfLogin mmLoginSSOCode or mmLoginSSOInAppCode
      */
-    self.openBrowserForSSOLogin = function(siteurl) {
-        $mmConfig.get('wsextservice').then(function(service) {
-            var passport = Math.random() * 1000;
-            var loginurl = siteurl + "/local/mobile/launch.php?service=" + service;
-            loginurl += "&passport=" + passport;
+    self.openBrowserForSSOLogin = function(siteurl, typeOfLogin) {
+        var passport = Math.random() * 1000;
+        var loginurl = siteurl + "/local/mobile/launch.php?service=" + mmCoreConfigConstants.wsextservice;
+        loginurl += "&passport=" + passport;
+        loginurl += "&urlscheme=" + mmCoreConfigConstants.customurlscheme;
 
-            // Store the siteurl and passport in $mmConfig for persistence. We are "configuring"
-            // the app to wait for an SSO. $mmConfig shouldn't be used as a temporary storage.
-            $mmConfig.set(mmLoginLaunchSiteURL, siteurl);
-            $mmConfig.set(mmLoginLaunchPassport, passport);
+        // Store the siteurl and passport in $mmConfig for persistence. We are "configuring"
+        // the app to wait for an SSO. $mmConfig shouldn't be used as a temporary storage.
+        $mmConfig.set(mmLoginLaunchSiteURL, siteurl);
+        $mmConfig.set(mmLoginLaunchPassport, passport);
 
+        if (typeOfLogin == mmLoginSSOInAppCode) {
+            $translate('mm.login.cancel').then(function(cancelStr) {
+                var options = {
+                    clearsessioncache: 'yes', // Clear the session cache to allow for multiple logins.
+                    closebuttoncaption: cancelStr,
+                };
+                $mmUtil.openInApp(loginurl, options);
+            });
+        } else {
             $mmUtil.openInBrowser(loginurl);
             if (navigator.app) {
                 navigator.app.exitApp();
             }
-        });
+        }
     };
 
     /**
@@ -148,7 +210,7 @@ angular.module('mm.core.login')
         } else {
             return $mmSitesManager.newSite(siteurl, token);
         }
-    }
+    };
 
     return self;
 });

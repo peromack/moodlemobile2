@@ -21,17 +21,45 @@ angular.module('mm.addons.messages')
  * @ngdoc controller
  * @name mmaMessagesIndexCtrl
  */
-.controller('mmaMessagesIndexCtrl', function($scope, $mmEvents, $ionicPlatform, $ionicTabsDelegate,
-            mmaMessagesDiscussionLoadedEvent, mmaMessagesDiscussionLeftEvent) {
+.controller('mmaMessagesIndexCtrl', function($scope, $mmEvents, $ionicPlatform, $ionicTabsDelegate, $mmUser,
+            mmaMessagesDiscussionLoadedEvent, mmaMessagesDiscussionLeftEvent, mmaMessagesToggleDeleteEvent) {
+
+    $scope.data = {
+        canDelete: false
+    };
+
     // Listen for discussion loaded event to show user profile link in tablet view.
-    var obsLoaded = $mmEvents.on(mmaMessagesDiscussionLoadedEvent, function(userId) {
-        $scope.profileLink = $ionicPlatform.isTablet() && $ionicTabsDelegate.selectedIndex() == 0;
-        $scope.userId = userId;
+    var obsLoaded = $mmEvents.on(mmaMessagesDiscussionLoadedEvent, function(data) {
+        if ($ionicPlatform.isTablet()) {
+            // A discussion was loaded in tablet, get the user image and show the button to the profile only once.
+            if ($scope.userId != data.userId) {
+                $scope.userId = data.userId;
+                $mmUser.getProfile(data.userId, undefined, true).catch(function() {
+                    // Couldn't retrieve the image, use a default icon.
+                    return {
+                        profileimageurl: true
+                    };
+                }).then(function(user) {
+                    // Verify that no other user was loaded while the async call was in progress.
+                    if ($scope.userId == data.userId) {
+                        // Use a default icon if no image URL available.
+                        $scope.profileLink = user.profileimageurl || true;
+                    }
+                });
+            }
+            $scope.data.canDelete = data.canDelete;
+        }
     });
+
+    $scope.toggleDelete = function() {
+        $mmEvents.trigger(mmaMessagesToggleDeleteEvent);
+    };
 
     // Listen for discussion loaded event to show user profile link in tablet view.
     var obsLeft = $mmEvents.on(mmaMessagesDiscussionLeftEvent, function() {
+        $scope.canDelete = false;
         $scope.profileLink = false;
+        $scope.userId = false;
     });
 
     $scope.$on('$destroy', function() {

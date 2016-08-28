@@ -23,33 +23,48 @@ angular.module('mm.addons.messages')
  */
 .controller('mmaMessagesDiscussionCtrl', function($scope, $stateParams, $mmApp, $mmaMessages, $mmSite, $timeout, $mmEvents, $window,
         $ionicScrollDelegate, mmUserProfileState, $mmUtil, mmaMessagesPollInterval, $interval, $log, $ionicHistory, $ionicPlatform,
-        mmCoreEventKeyboardShow, mmCoreEventKeyboardHide, mmaMessagesDiscussionLoadedEvent, mmaMessagesDiscussionLeftEvent) {
+        mmCoreEventKeyboardShow, mmCoreEventKeyboardHide, mmaMessagesDiscussionLoadedEvent, mmaMessagesDiscussionLeftEvent,
+        $mmUser, $translate, mmaMessagesNewMessageEvent, mmaMessagesToggleDeleteEvent) {
 
     $log = $log.getInstance('mmaMessagesDiscussionCtrl');
 
     var userId = $stateParams.userId,
-        userFullname = $stateParams.userFullname,
         messagesBeingSent = 0,
         polling,
+        fetching,
         backView = $ionicHistory.backView(),
-        lastMessage,
-        scrollView = $ionicScrollDelegate.$getByHandle('mmaMessagesScroll');
+        lastMessage = {message: '', timecreated: 0},
+        obsToggleDelete,
+        scrollView = $ionicScrollDelegate.$getByHandle('mmaMessagesScroll'),
+        canDelete = $mmaMessages.canDeleteMessages(); // Check if user can delete messages.
 
     $scope.loaded = false;
     $scope.messages = [];
     $scope.userId = userId;
     $scope.currentUserId = $mmSite.getUserId();
-    $scope.profileLink = true;
+    $scope.data = {
+        showDelete: false,
+        canDelete: false
+    };
 
-    if (userFullname) {
-        $scope.title = userFullname;
-    }
-
-    // Disable the profile button if we're coming from a profile. It is safer to prevent forbid the access
-    // to the full profile (we do not know the course ID they came from) as some users cannot view the full
-    // profile of other users.
+    // Disable the profile button if we're already coming from a profile.
     if (backView && backView.stateName === mmUserProfileState) {
         $scope.profileLink = false;
+    }
+
+    if (userId) {
+        // Get the user profile to retrieve the user fullname and image.
+        $mmUser.getProfile(userId, undefined, true).then(function(user) {
+            if (!$scope.title) {
+                $scope.title = user.fullname;
+            }
+            if (typeof $scope.profileLink == 'undefined') {
+                $scope.profileLink = user.profileimageurl || true;
+            }
+        }).catch(function() {
+            // Couldn't retrieve the image, use a default icon.
+            $scope.profileLink = true;
+        });
     }
 
     $scope.isAppOffline = function() {
@@ -74,6 +89,8 @@ angular.module('mm.addons.messages')
             // Silent error.
             return;
         }
+
+        $scope.data.showDelete = false;
 
         text = text.replace(/(?:\r\n|\r|\n)/g, '<br />');
         message = {
@@ -108,7 +125,7 @@ angular.module('mm.addons.messages')
     // Fetch the messages for the first time.
     $mmaMessages.getDiscussion(userId).then(function(messages) {
         $scope.messages = $mmaMessages.sortMessages(messages);
-        if (!userFullname && messages && messages.length > 0) {
+        if (!$scope.title && messages && messages.length > 0) {
             // When we did not receive the fullname via argument. Also it is possible that
             // we cannot resolve the name when no messages were yet exchanged.
             if (messages[0].useridto != $scope.currentUserId) {
@@ -125,8 +142,35 @@ angular.module('mm.addons.messages')
             $mmUtil.showErrorModal('mma.messages.errorwhileretrievingmessages', true);
         }
     }).finally(function() {
+        triggerDiscussionLoadedEvent();
         $scope.loaded = true;
     });
+
+    var triggerDiscussionLoadedEvent = function() {
+        if (canDelete) {
+            var last = $scope.messages[$scope.messages.length - 1];
+            // Check if last message sent has id (so it can be deleted).
+            $scope.data.canDelete = (last && last.id && $scope.messages.length == 1) || $scope.messages.length > 1;
+
+            if ($ionicPlatform.isTablet()) {
+                $mmEvents.trigger(mmaMessagesDiscussionLoadedEvent, {userId: $scope.userId, canDelete: $scope.data.canDelete});
+
+                if ($scope.data.canDelete) {
+                    if (!obsToggleDelete) {
+                        // Listen for ToggleDelete button clicked event.
+                        obsToggleDelete = $mmEvents.on(mmaMessagesToggleDeleteEvent, function() {
+                            $scope.toggleDelete();
+                        });
+                    }
+                } else {
+                    if (obsToggleDelete && obsToggleDelete.off) {
+                        obsToggleDelete.off();
+                        obsToggleDelete = false;
+                    }
+                }
+            }
+        }
+    };
 
     $scope.scrollAfterRender = function(scope) {
         if (scope.$last === true) {
@@ -138,6 +182,43 @@ angular.module('mm.addons.messages')
         }
     };
 
+    $scope.toggleDelete = function() {
+        $scope.data.showDelete = !$scope.data.showDelete;
+    };
+
+    // Convenience function to fetch messages.
+    function fetchMessages() {
+        $log.debug('Polling new messages for discussion with user ' + userId);
+        if (messagesBeingSent > 0) {
+            // We do not poll while a message is being sent or we could confuse the user
+            // as his message would disappear from the list, and he'd have to wait for the
+            // interval to check for new messages.
+            return;
+        } else if (!$mmApp.isOnline()) {
+            // Obviously we cannot check for new messages when the app is offline.
+            return;
+        } else if (fetching) {
+            // Already fetching.
+            return;
+        }
+
+        fetching = true;
+
+        // Invalidate the cache before fetching.
+        $mmaMessages.invalidateDiscussionCache(userId);
+        $mmaMessages.getDiscussion(userId).then(function(messages) {
+            if (messagesBeingSent > 0) {
+                // Ignore polling if due to a race condition.
+                return;
+            }
+            $scope.messages = $mmaMessages.sortMessages(messages);
+
+            notifyNewMessage();
+        }).finally(function() {
+            fetching = false;
+        });
+    }
+
     // Set a polling to get new messages every certain time.
     function setPolling() {
         if (polling) {
@@ -146,29 +227,7 @@ angular.module('mm.addons.messages')
         }
 
         // Start polling.
-        polling = $interval(function() {
-            $log.debug('Polling new messages for discussion with user ' + userId);
-            if (messagesBeingSent > 0) {
-                // We do not poll while a message is being sent or we could confuse the user
-                // as his message would disappear from the list, and he'd have to wait for the
-                // interval to check for new messages.
-                return;
-            } else if (!$mmApp.isOnline()) {
-                // Obviously we cannot check for new messages when the app is offline.
-                return;
-            }
-
-            // Invalidate the cache before fetching.
-            $mmaMessages.invalidateDiscussionCache(userId);
-            $mmaMessages.getDiscussion(userId).then(function(messages) {
-                if (messagesBeingSent > 0) {
-                    // Ignore polling if due to a race condition.
-                    return;
-                }
-                $scope.messages = $mmaMessages.sortMessages(messages);
-                notifyNewMessage();
-            });
-        }, mmaMessagesPollInterval);
+        polling = $interval(fetchMessages, mmaMessagesPollInterval);
     }
 
     // Unset polling.
@@ -202,13 +261,30 @@ angular.module('mm.addons.messages')
 
     // Notify the last message found so discussions list controller can tell if last message should be updated.
     function notifyNewMessage() {
-        var last = $scope.messages[$scope.messages.length - 1];
-        if (last && last.smallmessage !== lastMessage) {
-            lastMessage = last.smallmessage;
-            $mmEvents.trigger($mmaMessages.getDiscussionEventName(userId), {
-                message: lastMessage,
-                timecreated: last.timecreated
+        var last = $scope.messages[$scope.messages.length - 1],
+            trigger = false;
+        if ((last && (last.smallmessage !== lastMessage.message || last.timecreated !== lastMessage.timecreated))) {
+            lastMessage = {message: last.smallmessage, timecreated: last.timecreated};
+            trigger = true;
+        } else if (!last) {
+            lastMessage = {message: "", timecreated: 0};
+            trigger = true;
+        }
+
+        if (trigger) {
+            // Update discussions last message.
+            $mmEvents.trigger(mmaMessagesNewMessageEvent, {
+                siteid: $mmSite.getId(),
+                userid: userId,
+                message: lastMessage.message,
+                timecreated: lastMessage.timecreated
             });
+
+            // Update navBar links and buttons.
+            var newCanDelete = (last && last.id && $scope.messages.length == 1) || $scope.messages.length > 1;
+            if (canDelete && ($scope.data.canDelete != newCanDelete)) {
+                triggerDiscussionLoadedEvent();
+            }
         }
     }
 
@@ -256,12 +332,31 @@ angular.module('mm.addons.messages')
         }
     }
 
-    if ($ionicPlatform.isTablet()) {
-        $mmEvents.trigger(mmaMessagesDiscussionLoadedEvent, userId);
-    }
+    // Function to delete a message.
+    $scope.deleteMessage = function(message, index) {
+        $mmUtil.showConfirm($translate('mma.messages.deletemessageconfirmation')).then(function() {
+            var modal = $mmUtil.showModalLoading('mm.core.deleting', true);
+            $mmaMessages.deleteMessage(message.id, message.read).then(function() {
+                $scope.messages.splice(index, 1); // Remove message from the list without having to wait for re-fetch.
+                fetchMessages(); // Re-fetch messages to update cached data.
+            }).catch(function(error) {
+                if (typeof error === 'string') {
+                    $mmUtil.showErrorModal(error);
+                } else {
+                    $mmUtil.showErrorModal('mma.messages.errordeletemessage', true);
+                }
+            }).finally(function() {
+                modal.dismiss();
+            });
+        });
+    };
+
     $scope.$on('$destroy', function() {
         if ($ionicPlatform.isTablet()) {
             $mmEvents.trigger(mmaMessagesDiscussionLeftEvent);
+            if (obsToggleDelete && obsToggleDelete.off) {
+                obsToggleDelete.off();
+            }
         }
     });
 
